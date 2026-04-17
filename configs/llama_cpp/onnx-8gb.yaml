@@ -1,0 +1,54 @@
+# MOSS-TTS-Delay — 8 GB GPU config (ONNX audio, low-memory mode)
+#
+# Uses staged loading (low_memory: true) to load/unload components per stage.
+# Peak VRAM ~5.6 GB, fits on 8 GB GPUs.
+#
+# Setup:
+#   pip install -e ".[llama-cpp-onnx]"
+#   huggingface-cli download OpenMOSS-Team/MOSS-TTS-GGUF --local-dir weights/MOSS-TTS-GGUF
+#   huggingface-cli download OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX --local-dir weights/MOSS-Audio-Tokenizer-ONNX
+
+# ── Model paths ──────────────────────────────────────────────────────────────
+
+backbone_gguf: weights/MOSS-TTS-GGUF/MOSS_TTS_Q4_K_M.gguf
+embedding_dir: weights/MOSS-TTS-GGUF/embeddings
+lm_head_dir: weights/MOSS-TTS-GGUF/lm_heads
+tokenizer_dir: weights/MOSS-TTS-GGUF/tokenizer
+
+# ── Audio tokenizer ──────────────────────────────────────────────────────────
+
+audio_backend: onnx
+audio_encoder_onnx: weights/MOSS-Audio-Tokenizer-ONNX/encoder.onnx
+audio_decoder_onnx: weights/MOSS-Audio-Tokenizer-ONNX/decoder.onnx
+
+# ── LM heads backend ────────────────────────────────────────────────────────
+# numpy = 0 GPU VRAM for heads. Required on 8 GB (backbone uses ~5.6 GB).
+
+heads_backend: numpy
+
+# ── Runtime settings ─────────────────────────────────────────────────────────
+
+n_ctx: 4096
+n_batch: 512
+n_threads: 6
+n_gpu_layers: -1
+max_new_tokens: 3072
+use_gpu_audio: true
+low_memory: true
+
+# ── KV cache / attention ────────────────────────────────────────────────────
+
+kv_cache_type_k: q8_0
+kv_cache_type_v: q8_0
+flash_attn: enabled
+
+# ── Sampling parameters ──────────────────────────────────────────────────────
+
+text_temperature: 1.5
+text_top_p: 1.0
+text_top_k: 50
+
+audio_temperature: 1.7
+audio_top_p: 0.8
+audio_top_k: 25
+audio_repetition_penalty: 1.0

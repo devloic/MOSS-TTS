@@ -212,3 +212,11 @@ dev/*
 
 # Weights
 weights
+
+# MOSS-TTS demo additions
+weights/
+voices/custom/
+llama.cpp-moss/build-cuda/
+llama.cpp-moss/build/
+*.pyc
+output*.wav
