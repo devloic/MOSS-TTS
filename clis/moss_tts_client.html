@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MOSS-TTS Client</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; }
+.app { max-width: 700px; margin: 0 auto; padding: 20px; }
+h1 { font-size: 24px; font-weight: 700; margin-bottom: 4px; }
+.subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
+.badge { display: inline-block; background: #b45309; color: white; font-size: 11px; padding: 2px 8px; border-radius: 8px; margin-left: 8px; vertical-align: middle; }
+
+/* Cards */
+.card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.card-title { font-size: 14px; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+
+/* Form elements */
+label { display: block; font-size: 13px; color: #aaa; margin-bottom: 4px; }
+textarea { width: 100%; background: #111; border: 1px solid #333; border-radius: 8px; color: #e0e0e0; padding: 10px; font-size: 14px; font-family: inherit; resize: vertical; }
+textarea:focus { outline: none; border-color: #b45309; }
+select, input[type="number"] { width: 100%; background: #111; border: 1px solid #333; border-radius: 8px; color: #e0e0e0; padding: 8px 10px; font-size: 14px; }
+select:focus, input:focus { outline: none; border-color: #b45309; }
+
+/* Grid */
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; }
+
+/* Buttons */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary { background: #b45309; color: white; width: 100%; }
+.btn-primary:hover:not(:disabled) { background: #d97706; }
+.btn-record { background: #dc2626; color: white; }
+.btn-record:hover:not(:disabled) { background: #ef4444; }
+.btn-record.recording { background: #7f1d1d; animation: pulse 1s infinite; }
+.btn-stop { background: #555; color: white; }
+.btn-stop:hover { background: #666; }
+.btn-sm { padding: 6px 14px; font-size: 13px; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+/* Audio player */
+audio { width: 100%; height: 40px; margin-top: 8px; }
+
+/* Recorder */
+.recorder { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.rec-indicator { width: 10px; height: 10px; border-radius: 50%; background: #333; }
+.rec-indicator.active { background: #dc2626; animation: pulse 1s infinite; }
+.rec-time { font-size: 13px; color: #888; font-variant-numeric: tabular-nums; }
+
+/* Status */
+.status { font-size: 13px; color: #888; margin-top: 8px; min-height: 20px; }
+.status.error { color: #ef4444; }
+.status.success { color: #22c55e; }
+
+/* Loading spinner */
+.spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #333; border-top-color: #b45309; border-radius: 50%; animation: spin 0.6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Voice filter tabs */
+.lang-tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
+.lang-tab { padding: 4px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; background: #222; border: 1px solid #333; color: #aaa; }
+.lang-tab.active { background: #b45309; border-color: #b45309; color: white; }
+.lang-tab:hover:not(.active) { background: #2a2a2a; }
+
+/* Reference audio section */
+.ref-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid #2a2a2a; }
+.ref-label { font-size: 12px; color: #666; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+    <h1>MOSS-TTS<span class="badge">8B</span></h1>
+    <div class="subtitle">Text-to-Speech — EN / FR / ES / DE</div>
+
+    <!-- Text input -->
+    <div class="card">
+        <div class="card-title">Text</div>
+        <textarea id="text" rows="4" placeholder="Enter text to synthesize...">Bonjour et bienvenue. Nous allons explorer les merveilles de la cuisine française.</textarea>
+    </div>
+
+    <!-- Voice selection -->
+    <div class="card">
+        <div class="card-title">Voice</div>
+        <div class="lang-tabs" id="lang-tabs">
+            <div class="lang-tab active" data-lang="">All</div>
+            <div class="lang-tab" data-lang="en">English</div>
+            <div class="lang-tab" data-lang="fr">French</div>
+            <div class="lang-tab" data-lang="es">Spanish</div>
+            <div class="lang-tab" data-lang="de">German</div>
+        </div>
+        <select id="voice"></select>
+
+        <!-- Reference audio recorder -->
+        <div class="ref-section">
+            <div class="ref-label">Or use your own voice (overrides preset):</div>
+            <div class="recorder">
+                <button class="btn btn-record btn-sm" id="rec-btn" onclick="toggleRecord()">Record</button>
+                <div class="rec-indicator" id="rec-indicator"></div>
+                <span class="rec-time" id="rec-time">0:00</span>
+                <button class="btn btn-stop btn-sm" id="clear-ref" onclick="clearRef()" style="display:none">Clear</button>
+            </div>
+            <audio id="ref-player" controls style="display:none"></audio>
+            <div id="save-voice-row" style="display:none; margin-top: 8px;">
+                <div class="row">
+                    <input type="text" id="save-voice-name" placeholder="Voice name" style="background:#111; border:1px solid #333; border-radius:8px; color:#e0e0e0; padding:8px 10px; font-size:14px;">
+                    <select id="save-voice-lang" style="max-width:100px;">
+                        <option value="en">EN</option>
+                        <option value="fr">FR</option>
+                        <option value="es">ES</option>
+                        <option value="de">DE</option>
+                    </select>
+                    <button class="btn btn-sm btn-stop" onclick="saveVoice()">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings -->
+    <div class="card">
+        <div class="card-title">Settings</div>
+        <div class="row">
+            <div>
+                <label>Model</label>
+                <select id="model"></select>
+            </div>
+            <div>
+                <label>Quality</label>
+                <select id="preset"></select>
+            </div>
+            <div>
+                <label>Format</label>
+                <select id="format">
+                    <option value="mp3" selected>MP3</option>
+                    <option value="wav">WAV</option>
+                </select>
+            </div>
+        </div>
+        <div class="row" style="margin-top: 8px;">
+            <div>
+                <label>Seed</label>
+                <input type="number" id="seed" value="0" min="0" placeholder="0 = random">
+            </div>
+        </div>
+    </div>
+
+    <!-- Generate -->
+    <button class="btn btn-primary" id="gen-btn" onclick="generate()">Generate Speech</button>
+    <div class="status" id="status"></div>
+
+    <!-- Output -->
+    <div class="card" id="output-card" style="display:none; margin-top: 16px;">
+        <div class="card-title">Output</div>
+        <audio id="output-player" controls></audio>
+        <div style="margin-top: 8px; text-align: right;">
+            <a id="download-link" class="btn btn-sm btn-stop" download="speech.mp3">Download</a>
+        </div>
+    </div>
+</div>
+
+<script>
+const API = window.location.origin;
+
+// ── Model loading ───────────────────────────────────────────────────────────
+async function loadModels() {
+    try {
+        const resp = await fetch(`${API}/models`);
+        const data = await resp.json();
+        const select = document.getElementById('model');
+        select.innerHTML = '';
+        (data.models || []).forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = `${m.name} — ${m.description}`;
+            if (m.id === data.default) opt.selected = true;
+            select.appendChild(opt);
+        });
+    } catch (e) {
+        console.error('Failed to load models:', e);
+    }
+}
+
+// ── Preset loading ──────────────────────────────────────────────────────────
+async function loadPresets() {
+    try {
+        const resp = await fetch(`${API}/presets`);
+        const data = await resp.json();
+        const select = document.getElementById('preset');
+        select.innerHTML = '';
+        (data.presets || []).forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = `${p.name} — ${p.description}`;
+            if (p.id === data.default) opt.selected = true;
+            select.appendChild(opt);
+        });
+    } catch (e) {
+        console.error('Failed to load presets:', e);
+    }
+}
+
+// ── Voice loading ───────────────────────────────────────────────────────────
+let allVoices = [];
+let currentLang = '';
+
+async function loadVoices() {
+    try {
+        const resp = await fetch(`${API}/voices`);
+        const data = await resp.json();
+        allVoices = data.voices || [];
+        renderVoices();
+    } catch (e) {
+        setStatus('Failed to load voices: ' + e.message, 'error');
+    }
+}
+
+function renderVoices() {
+    const select = document.getElementById('voice');
+    const filtered = currentLang ? allVoices.filter(v => v.language === currentLang) : allVoices;
+    select.innerHTML = '<option value="">No voice (default)</option>';
+    filtered.forEach(v => {
+        const label = `${v.name} — ${v.accent} (${v.language}, ${v.gender})`;
+        select.innerHTML += `<option value="${v.id}">${label}</option>`;
+    });
+    // Auto-select first voice
+    if (filtered.length > 0) select.value = filtered[0].id;
+}
+
+// Language tabs
+document.getElementById('lang-tabs').addEventListener('click', e => {
+    const tab = e.target.closest('.lang-tab');
+    if (!tab) return;
+    document.querySelectorAll('.lang-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentLang = tab.dataset.lang;
+    renderVoices();
+    // Auto-set save language
+    if (currentLang) document.getElementById('save-voice-lang').value = currentLang;
+});
+
+// ── Recording ───────────────────────────────────────────────────────────────
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordedBlob = null;
+let recTimer = null;
+let recStart = 0;
+
+async function toggleRecord() {
+    const btn = document.getElementById('rec-btn');
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+        btn.textContent = 'Record';
+        btn.classList.remove('recording');
+        document.getElementById('rec-indicator').classList.remove('active');
+        clearInterval(recTimer);
+        return;
+    }
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recordedChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+
+        mediaRecorder.ondataavailable = e => {
+            if (e.data.size > 0) recordedChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = () => {
+            stream.getTracks().forEach(t => t.stop());
+            recordedBlob = new Blob(recordedChunks, { type: 'audio/wav' });
+            const url = URL.createObjectURL(recordedBlob);
+            const player = document.getElementById('ref-player');
+            player.src = url;
+            player.style.display = '';
+            document.getElementById('clear-ref').style.display = '';
+            document.getElementById('save-voice-row').style.display = '';
+        };
+
+        mediaRecorder.start();
+        btn.textContent = 'Stop';
+        btn.classList.add('recording');
+        document.getElementById('rec-indicator').classList.add('active');
+        recStart = Date.now();
+        recTimer = setInterval(() => {
+            const sec = Math.floor((Date.now() - recStart) / 1000);
+            document.getElementById('rec-time').textContent = `${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}`;
+        }, 200);
+    } catch (e) {
+        setStatus('Microphone access denied: ' + e.message, 'error');
+    }
+}
+
+function clearRef() {
+    recordedBlob = null;
+    document.getElementById('ref-player').style.display = 'none';
+    document.getElementById('clear-ref').style.display = 'none';
+    document.getElementById('save-voice-row').style.display = 'none';
+    document.getElementById('rec-time').textContent = '0:00';
+}
+
+async function saveVoice() {
+    if (!recordedBlob) { setStatus('Record audio first.', 'error'); return; }
+    const name = document.getElementById('save-voice-name').value.trim();
+    if (!name) { setStatus('Enter a name for the voice.', 'error'); return; }
+
+    const lang = document.getElementById('save-voice-lang').value;
+    const formData = new FormData();
+    formData.append('name', name);
+    formData.append('language', lang);
+    formData.append('audio', recordedBlob, 'recording.wav');
+
+    try {
+        const resp = await fetch(`${API}/voices/save`, { method: 'POST', body: formData });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Save failed');
+        setStatus(`Saved voice "${name}" (id: ${data.id})`, 'success');
+        document.getElementById('save-voice-name').value = '';
+        // Refresh voice list
+        await loadVoices();
+        // Select the new voice
+        document.getElementById('voice').value = data.id;
+    } catch (e) {
+        setStatus('Save failed: ' + e.message, 'error');
+    }
+}
+
+// ── Generation ──────────────────────────────────────────────────────────────
+async function generate() {
+    const text = document.getElementById('text').value.trim();
+    if (!text) { setStatus('Enter some text first.', 'error'); return; }
+
+    const btn = document.getElementById('gen-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Generating...';
+    setStatus('');
+
+    const formData = new FormData();
+    formData.append('text', text);
+    formData.append('voice', document.getElementById('voice').value);
+    formData.append('model', document.getElementById('model').value);
+    formData.append('preset', document.getElementById('preset').value);
+    formData.append('format', document.getElementById('format').value);
+    formData.append('seed', document.getElementById('seed').value);
+
+    if (recordedBlob) {
+        formData.append('reference_audio', recordedBlob, 'recording.wav');
+    }
+
+    const t0 = Date.now();
+
+    try {
+        const resp = await fetch(`${API}/tts`, { method: 'POST', body: formData });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.error || 'Generation failed');
+        }
+
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const fmt = document.getElementById('format').value;
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+        const player = document.getElementById('output-player');
+        player.src = url;
+        player.play();
+
+        const dl = document.getElementById('download-link');
+        dl.href = url;
+        dl.download = `speech.${fmt}`;
+        dl.textContent = `Download ${fmt.toUpperCase()}`;
+
+        document.getElementById('output-card').style.display = '';
+        setStatus(`Generated in ${elapsed}s`, 'success');
+
+    } catch (e) {
+        setStatus(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = 'Generate Speech';
+    }
+}
+
+function setStatus(msg, type = '') {
+    const el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = 'status' + (type ? ' ' + type : '');
+}
+
+// ── Init ────────────────────────────────────────────────────────────────────
+loadModels();
+loadPresets();
+loadVoices();
+</script>
+</body>
+</html>

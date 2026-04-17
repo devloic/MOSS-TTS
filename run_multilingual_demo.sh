@@ -37,8 +37,11 @@ Options:
   -s, --share               Create a public Gradio share link
   -h, --help                Show this help message
 
+  -A, --api                 Run REST API only (no Gradio UI), port 7864
+
 Examples:
   $(basename "$0")                    # 8B llama.cpp (default, best quality)
+  $(basename "$0") --api              # REST API (curl-friendly)
   $(basename "$0") --nano             # Nano 100M (fast, lighter)
   $(basename "$0") --full             # Full 8B PyTorch (needs big GPU)
 EOF
@@ -49,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--nano)    MODE="nano"; shift ;;
         -f|--full)    MODE="full"; shift ;;
+        -A|--api)     MODE="api"; shift ;;
         -R|--no-reload) RELOAD=0; shift ;;
         -d|--device)  DEVICE="$2"; shift 2 ;;
         -p|--port)    PORT="$2"; shift 2 ;;
@@ -138,6 +142,36 @@ elif [[ "$MODE" == "8b" ]]; then
 
     exec python "$SCRIPT_DIR/clis/moss_tts_8b_multilingual_demo.py" \
         --port "$PORT" --host "$HOST" $SHARE
+
+# ── API mode ────────────────────────────────────────────────────────────────
+elif [[ "$MODE" == "api" ]]; then
+    [[ "$PORT" == "7861" ]] && PORT="7864"
+    [[ -z "$CONDA_ENV" ]] && CONDA_ENV="moss-8b"
+
+    echo "=== MOSS-TTS REST API ==="
+    echo "  Conda env: $CONDA_ENV"
+    echo "  Port:      $PORT"
+    echo "  Host:      $HOST"
+    echo "=========================="
+
+    activate_conda
+
+    if [[ ! -f "$SCRIPT_DIR/weights/MOSS-TTS-GGUF/first_class/MOSS_TTS_FIRST_CLASS_Q4_K_M.gguf" ]]; then
+        echo "[Error] Weights not found. Run ./setup_8b_llamacpp.sh first."
+        exit 1
+    fi
+
+    LLAMA_MOSS_DIR="${SCRIPT_DIR}/llama.cpp-moss"
+    export MOSS_8B_MODEL="$SCRIPT_DIR/weights/MOSS-TTS-GGUF/first_class/MOSS_TTS_FIRST_CLASS_Q4_K_M.gguf"
+    export MOSS_8B_MODEL_F16="$SCRIPT_DIR/weights/MOSS-TTS-GGUF/first_class/MOSS_TTS_FIRST_CLASS_F16.gguf"
+    export MOSS_8B_ENCODER="$SCRIPT_DIR/weights/MOSS-Audio-Tokenizer-GGUF/encoder_f16.gguf"
+    export MOSS_8B_DECODER="$SCRIPT_DIR/weights/MOSS-Audio-Tokenizer-GGUF/decoder_f16.gguf"
+    export MOSS_8B_BINARY="$LLAMA_MOSS_DIR/build-cuda/bin/llama-moss-tts"
+    export MOSS_8B_BINARY_INTERACTIVE="$LLAMA_MOSS_DIR/build-cuda/bin/llama-moss-tts-interactive"
+    export LD_LIBRARY_PATH="$LLAMA_MOSS_DIR/build-cuda/bin:${LD_LIBRARY_PATH:-}"
+
+    exec python "$SCRIPT_DIR/clis/moss_tts_api.py" \
+        --port "$PORT" --host "$HOST"
 
 # ── Full PyTorch mode ───────────────────────────────────────────────────────
 else
