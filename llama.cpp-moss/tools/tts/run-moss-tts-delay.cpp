@@ -1252,20 +1252,20 @@ static moss_owned_batch moss_batch_from_audio_codes(
     return owned_batch;
 }
 
-static std::vector<llama_token> moss_encode_audio_llama(
-        const std::string & audio_encoder_model_path,
+// Encode a reference wav using a *pre-loaded* audio-encoder model. A fresh
+// llama_context is created for each call (n_ctx depends on the wav length)
+// and destroyed at return, but the model itself is not reloaded. This is
+// the hot path in interactive mode — reloading the model every request was
+// causing heap fragmentation that culminated in a glibc
+// "corrupted size vs. prev_size" crash after a few hundred requests.
+static std::vector<llama_token> moss_encode_audio_llama_with_model(
+        llama_model * model,
         const std::string & wav_path,
-        int32_t n_gpu_layers,
         uint32_t n_quantizers,
         size_t * out_frames) {
-    moss_audio_runtime runtime;
-    runtime.model = moss_load_audio_model(
-            audio_encoder_model_path,
-            "moss-tts-audio-encoder",
-            n_gpu_layers);
-    const int sample_rate = (int) moss_audio_model_sampling_rate(runtime.model.get(), "moss-tts-audio-encoder");
-    const uint32_t downsample_rate = moss_audio_model_downsample_rate(runtime.model.get(), "moss-tts-audio-encoder");
-    const uint32_t model_quantizers = moss_audio_model_num_quantizers(runtime.model.get(), "moss-tts-audio-encoder");
+    const int sample_rate      = (int) moss_audio_model_sampling_rate(model, "moss-tts-audio-encoder");
+    const uint32_t downsample_rate   = moss_audio_model_downsample_rate(model, "moss-tts-audio-encoder");
+    const uint32_t model_quantizers  = moss_audio_model_num_quantizers(model, "moss-tts-audio-encoder");
     const uint32_t nq = n_quantizers == 0 ? model_quantizers : n_quantizers;
     if (nq == 0 || nq > model_quantizers) {
         throw std::runtime_error("invalid audio encoder quantizer count");
@@ -1286,17 +1286,17 @@ static std::vector<llama_token> moss_encode_audio_llama(
     std::vector<float> padded_wav(padded_samples, 0.0f);
     std::copy(wav.begin(), wav.end(), padded_wav.begin());
 
-    runtime.ctx = moss_init_audio_context(runtime.model.get(), (uint32_t) padded_samples);
+    llama_context_ptr ctx = moss_init_audio_context(model, (uint32_t) padded_samples);
 
     moss_owned_batch batch = moss_batch_from_audio_waveform(padded_wav);
-    const int ret = llama_encode(runtime.ctx.get(), batch.batch);
+    const int ret = llama_encode(ctx.get(), batch.batch);
     if (ret != 0) {
         throw std::runtime_error("audio encoder llama_encode failed: " + std::to_string(ret));
     }
 
-    const int32_t n_out_i32 = llama_model_n_out_i32(runtime.model.get());
+    const int32_t n_out_i32 = llama_model_n_out_i32(model);
     const size_t padded_frames = padded_samples / (size_t) downsample_rate;
-    const int32_t * codes_i32 = llama_get_output_i32(runtime.ctx.get());
+    const int32_t * codes_i32 = llama_get_output_i32(ctx.get());
     if (codes_i32 == nullptr) {
         throw std::runtime_error("audio encoder returned null raw i32 outputs");
     }
@@ -1328,22 +1328,33 @@ static std::vector<llama_token> moss_encode_audio_llama(
     return trimmed;
 }
 
-static void moss_decode_audio_llama(
-        const std::string & audio_decoder_model_path,
+
+// Original load-per-call path (used by non-interactive CLI).
+static std::vector<llama_token> moss_encode_audio_llama(
+        const std::string & audio_encoder_model_path,
+        const std::string & wav_path,
+        int32_t n_gpu_layers,
+        uint32_t n_quantizers,
+        size_t * out_frames) {
+    llama_model_ptr model = moss_load_audio_model(
+            audio_encoder_model_path,
+            "moss-tts-audio-encoder",
+            n_gpu_layers);
+    return moss_encode_audio_llama_with_model(
+            model.get(), wav_path, n_quantizers, out_frames);
+}
+
+// Decode audio codes using a *pre-loaded* decoder model. Fresh ctx per call.
+// See rationale on moss_encode_audio_llama_with_model above.
+static void moss_decode_audio_llama_with_model(
+        llama_model * model,
         const std::vector<llama_token> & raw_codes,
         size_t raw_frames,
         const moss_delay_config & cfg,
-        int32_t n_gpu_layers,
         const std::string & wav_out_path) {
-    moss_audio_runtime runtime = moss_load_audio_runtime(
-            audio_decoder_model_path,
-            "moss-tts-audio-decoder",
-            n_gpu_layers,
-            std::max<uint32_t>((uint32_t) raw_frames, 1u));
-
-    const int sample_rate = (int) moss_audio_model_sampling_rate(runtime.model.get(), "moss-tts-audio-decoder");
-    const uint32_t downsample_rate = moss_audio_model_downsample_rate(runtime.model.get(), "moss-tts-audio-decoder");
-    const uint32_t model_quantizers = moss_audio_model_num_quantizers(runtime.model.get(), "moss-tts-audio-decoder");
+    const int sample_rate      = (int) moss_audio_model_sampling_rate(model, "moss-tts-audio-decoder");
+    const uint32_t downsample_rate  = moss_audio_model_downsample_rate(model, "moss-tts-audio-decoder");
+    const uint32_t model_quantizers = moss_audio_model_num_quantizers(model, "moss-tts-audio-decoder");
     if (cfg.n_vq != model_quantizers) {
         throw std::runtime_error(
                 "audio decoder quantizer count mismatch: model expects " +
@@ -1355,19 +1366,21 @@ static void moss_decode_audio_llama(
 
     std::vector<float> audio;
     if (raw_frames > 0) {
+        llama_context_ptr ctx = moss_init_audio_context(
+                model, std::max<uint32_t>((uint32_t) raw_frames, 1u));
         moss_owned_batch batch = moss_batch_from_audio_codes(raw_codes, raw_frames, cfg.n_vq);
-        const int ret = llama_encode(runtime.ctx.get(), batch.batch);
+        const int ret = llama_encode(ctx.get(), batch.batch);
         if (ret != 0) {
             throw std::runtime_error("audio decoder llama_encode failed: " + std::to_string(ret));
         }
 
-        const int32_t n_embd_out = llama_model_n_embd_out(runtime.model.get());
+        const int32_t n_embd_out = llama_model_n_embd_out(model);
         if (n_embd_out != 1) {
             throw std::runtime_error("audio decoder output dimension must be 1");
         }
 
         const size_t n_samples = raw_frames * (size_t) downsample_rate;
-        const float * embd = llama_get_embeddings(runtime.ctx.get());
+        const float * embd = llama_get_embeddings(ctx.get());
         if (embd == nullptr) {
             throw std::runtime_error("audio decoder returned null embeddings");
         }
@@ -1377,6 +1390,23 @@ static void moss_decode_audio_llama(
     if (!save_wav16(wav_out_path, audio, sample_rate)) {
         throw std::runtime_error("failed to write WAV file: " + wav_out_path);
     }
+}
+
+
+// Original load-per-call path (used by non-interactive CLI).
+static void moss_decode_audio_llama(
+        const std::string & audio_decoder_model_path,
+        const std::vector<llama_token> & raw_codes,
+        size_t raw_frames,
+        const moss_delay_config & cfg,
+        int32_t n_gpu_layers,
+        const std::string & wav_out_path) {
+    llama_model_ptr model = moss_load_audio_model(
+            audio_decoder_model_path,
+            "moss-tts-audio-decoder",
+            n_gpu_layers);
+    moss_decode_audio_llama_with_model(
+            model.get(), raw_codes, raw_frames, cfg, wav_out_path);
 }
 
 static std::vector<float> moss_read_wav_f32_mono(const std::string & path, int expected_sample_rate) {
@@ -2411,6 +2441,26 @@ static void moss_interactive_loop(
     const int32_t text_vocab = llama_vocab_n_tokens(vocab);
     const moss_delay_config cfg = moss_delay_config_from_model(backbone.get());
 
+    // ── Pre-load audio encoder/decoder ONCE ────────────────────────────
+    // They were previously reloaded per /tts request, which caused heap
+    // fragmentation and an eventual glibc "corrupted size vs. prev_size"
+    // crash after a few hundred requests. Load-once, fresh-ctx-per-request.
+    llama_model_ptr audio_encoder_model;
+    llama_model_ptr audio_decoder_model;
+    if (!audio_encoder_model_path.empty()) {
+        LOG("interactive: loading audio encoder...\n");
+        audio_encoder_model = moss_load_audio_model(
+                audio_encoder_model_path, "moss-tts-audio-encoder",
+                /*n_gpu_layers=*/0);
+    }
+    if (!audio_decoder_model_path.empty()) {
+        LOG("interactive: loading audio decoder...\n");
+        audio_decoder_model = moss_load_audio_model(
+                audio_decoder_model_path, "moss-tts-audio-decoder",
+                /*n_gpu_layers=*/0);
+    }
+    (void) use_gpu_audio;  // reserved for future: move audio models to GPU
+
     LOG("interactive: ready\n");
     fprintf(stdout, "{\"status\":\"ready\"}\n");
     fflush(stdout);
@@ -2439,15 +2489,18 @@ static void moss_interactive_loop(
             if (req_text.empty()) throw std::runtime_error("missing 'text' field");
             if (req_wav_out.empty()) throw std::runtime_error("missing 'wav_out' field");
 
-            // Encode reference audio if provided (on-demand, CPU)
+            // Encode reference audio if provided (on-demand, CPU). Model
+            // was loaded once at startup; only a fresh llama_context is
+            // created and destroyed here.
             std::vector<llama_token> reference_codes;
             size_t reference_frames = 0;
             if (!req_ref_audio.empty()) {
-                if (audio_encoder_model_path.empty()) {
+                if (!audio_encoder_model) {
                     throw std::runtime_error("reference audio requires --audio-encoder-model");
                 }
-                reference_codes = moss_encode_audio_llama(
-                        audio_encoder_model_path, req_ref_audio, 0, cfg.n_vq, &reference_frames);
+                reference_codes = moss_encode_audio_llama_with_model(
+                        audio_encoder_model.get(), req_ref_audio,
+                        cfg.n_vq, &reference_frames);
             }
 
             const moss_prompt_input prompt = moss_build_prompt_input(
@@ -2507,10 +2560,10 @@ static void moss_interactive_loop(
                     state, prompt.prompt_frames, cfg);
 
             float duration_s = 0.0f;
-            if (decoded.raw_frames > 0 && !audio_decoder_model_path.empty()) {
-                moss_decode_audio_llama(
-                        audio_decoder_model_path, decoded.raw_codes, decoded.raw_frames,
-                        cfg, 0, req_wav_out);
+            if (decoded.raw_frames > 0 && audio_decoder_model) {
+                moss_decode_audio_llama_with_model(
+                        audio_decoder_model.get(), decoded.raw_codes, decoded.raw_frames,
+                        cfg, req_wav_out);
                 duration_s = (float)(decoded.raw_frames * 480) / 24000.0f;
             }
 

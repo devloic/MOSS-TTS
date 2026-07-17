@@ -2002,8 +2002,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
     }
 
-    if (output_ids.size() < (size_t) n_outputs_max) {
-        output_ids.resize(n_outputs_max);
+    // output_ids is indexed by BATCH POSITION (out_id = out_ids[i], values up to
+    // n_batch-1 — see decode() "output_ids[out_id] = i" and reads at get_logits_ith),
+    // NOT by output slot. Sizing it to n_outputs_max overflows on a heap write when a
+    // batch has more tokens than outputs (e.g. MOSS packed multi-codebook prefill),
+    // corrupting the heap. Size to the batch capacity instead.
+    const size_t output_ids_size = std::max<size_t>((size_t) n_outputs_max, (size_t) cparams.n_batch);
+    if (output_ids.size() < output_ids_size) {
+        output_ids.resize(output_ids_size);
     }
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;

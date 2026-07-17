@@ -40,6 +40,7 @@ Example requests:
 """
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -62,6 +63,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 SAMPLE_RATE = 24000
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_DIR / ".env")
+except ImportError:
+    pass
+
 # Paths from environment
 LLAMA_MOSS_TTS_INTERACTIVE = os.environ.get("MOSS_8B_BINARY_INTERACTIVE", "")
 LLAMA_MOSS_TTS = os.environ.get("MOSS_8B_BINARY", "")
@@ -81,6 +88,69 @@ if MODEL_Q5 and Path(MODEL_Q5).exists():
 if MODEL_F16 and Path(MODEL_F16).exists():
     MODEL_REGISTRY["f16"] = {"name": "F16", "path": MODEL_F16, "ngl": 12, "description": "16 GB, mixed CPU/GPU, best quality"}
 DEFAULT_MODEL_ID = list(MODEL_REGISTRY.keys())[0] if MODEL_REGISTRY else ""
+
+# Forced aligner (lazy-loaded on first transcript request)
+_ALIGNER_MODEL = None
+_ALIGNER_LOCK = threading.Lock()
+# Device: "cpu" (default, saves VRAM for TTS) or "cuda"
+ALIGNER_DEVICE = os.environ.get("MOSS_ALIGNER_DEVICE", "cpu").lower()
+
+
+def _align_words(wav_path: str, text: str):
+    """Return [{text, start, end, score}] aligning `text` to audio in `wav_path`.
+
+    Uses torchaudio MMS_FA. Model is cached across calls.
+    Runs on CPU by default to avoid competing for VRAM with the TTS model;
+    override with MOSS_ALIGNER_DEVICE=cuda.
+    """
+    global _ALIGNER_MODEL
+    import torch
+    import torchaudio
+    import torchaudio.functional as F
+    from ctc_forced_aligner import align, _postprocess_results, load_transcript, load_audio, unflatten
+
+    device = torch.device(ALIGNER_DEVICE)
+
+    with _ALIGNER_LOCK:
+        if _ALIGNER_MODEL is None:
+            bundle = torchaudio.pipelines.MMS_FA
+            _ALIGNER_MODEL = (bundle.get_model(with_star=False).to(device), bundle)
+        model, bundle = _ALIGNER_MODEL
+
+    dictionary = bundle.get_dict(star=None)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
+        tf.write(text)
+        tscript_path = tf.name
+    try:
+        transcript, _lines = load_transcript(tscript_path, dictionary)
+    finally:
+        try:
+            os.unlink(tscript_path)
+        except OSError:
+            pass
+
+    if not transcript:
+        return []
+
+    waveform = load_audio(wav_path, ret_type="torch").to(device)
+    with torch.inference_mode():
+        emission, _ = model(waveform)
+
+    tokenized = [dictionary[c] for word in transcript for c in word
+                 if c in dictionary and dictionary[c] != 0]
+    aligned_tokens, scores = align(emission, tokenized, device)
+    token_spans = F.merge_tokens(aligned_tokens[0], scores[0])
+    word_spans = unflatten(token_spans, [len(w) for w in transcript])
+    words = _postprocess_results(
+        transcript, word_spans, waveform, emission.size(1), bundle.sample_rate, scores,
+    )
+
+    return [
+        {"text": w["text"], "start": round(float(w["start"]), 3),
+         "end": round(float(w["end"]), 3), "score": float(w["score"])}
+        for w in words
+    ]
 
 # Voice registry: id -> {name, file, language, gender, accent}
 VOICE_REGISTRY = {
@@ -146,7 +216,30 @@ def _resolve_voice_file(voice_id: str) -> str | None:
 # ── Interactive process manager ──────────────────────────────────────────────
 
 _interactive_procs: dict[str, subprocess.Popen] = {}
+# Per-process stderr ring buffer (last ~40 lines). Used to surface the
+# actual death cause when the child dies either at startup or mid-request.
+_interactive_stderr: dict[int, list[str]] = {}
 _interactive_lock = threading.Lock()
+
+
+def _stderr_tail(proc: subprocess.Popen) -> str:
+    """Return a short diagnostic line from the child's captured stderr."""
+    tail = list(_interactive_stderr.get(proc.pid, []))
+    priority = [
+        "out of memory", "cudamalloc", "cuda error",
+        "cuda_error_out_of_memory", "segmentation fault",
+        "assertion", "terminate called", "killed",
+        "no such file", "cannot open", "permission denied",
+        "unable to allocate",
+    ]
+    generic = ["error", "failed"]
+    for l in tail:
+        if any(k in l.lower() for k in priority):
+            return l[:300]
+    for l in tail:
+        if any(k in l.lower() for k in generic):
+            return l[:300]
+    return tail[-1][:300] if tail else ""
 
 
 def _get_interactive_proc(model_path: str, ngl: int) -> subprocess.Popen:
@@ -166,20 +259,67 @@ def _get_interactive_proc(model_path: str, ngl: int) -> subprocess.Popen:
         if ENCODER_PATH and Path(ENCODER_PATH).exists():
             cmd.extend(["--audio-encoder-model", ENCODER_PATH])
 
+        # Capture stderr so the final error surfaced to the API caller
+        # can include the real root cause (OOM, path not found, etc.)
+        # rather than a generic "died during startup".
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             text=True,
             env={**os.environ, "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", "")},
         )
+
+        # Stream stderr to a per-process ring buffer so we can surface the
+        # real cause when the child dies either here (startup) or in
+        # _send_request (mid-request).
+        stderr_tail: list[str] = []
+        _interactive_stderr[proc.pid] = stderr_tail
+        def _drain_stderr():
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_tail.append(line.rstrip())
+                if len(stderr_tail) > 40:
+                    stderr_tail.pop(0)
+        threading.Thread(target=_drain_stderr, daemon=True).start()
 
         while True:
             line = proc.stdout.readline()
             if not line:
                 proc.kill()
-                raise RuntimeError("Interactive process died during startup")
+                # Pick the most diagnostic stderr line: prefer lines
+                # containing known keywords, fall back to the last.
+                tail = list(stderr_tail)
+                # Pick the most actionable line. Priority order: specific
+                # resource/hardware errors first, then generic errors, then
+                # last line. "interactive mode failed" is too generic — we
+                # want the CAUSE, not the symptom.
+                priority_keywords = [
+                    "out of memory", "cudamalloc", "cuda error",
+                    "no such file", "cannot open", "permission denied",
+                    "unable to allocate",
+                ]
+                generic_keywords = ["error loading", "failed to load"]
+
+                detail = ""
+                for l in tail:
+                    if any(k in l.lower() for k in priority_keywords):
+                        detail = l
+                        break
+                if not detail:
+                    for l in tail:
+                        if any(k in l.lower() for k in generic_keywords):
+                            detail = l
+                            break
+                if not detail and tail:
+                    detail = tail[-1]
+
+                msg = "Interactive process died during startup"
+                if detail:
+                    msg += f": {detail[:300]}"
+                raise RuntimeError(msg)
             if '"ready"' in line.strip():
                 break
 
@@ -189,13 +329,29 @@ def _get_interactive_proc(model_path: str, ngl: int) -> subprocess.Popen:
 
 def _send_request(proc, request: dict) -> dict:
     line = json.dumps(request, ensure_ascii=False)
-    proc.stdin.write(line + "\n")
-    proc.stdin.flush()
+    try:
+        proc.stdin.write(line + "\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass  # child is already gone — fall through to readline
 
     while True:
         resp_line = proc.stdout.readline()
         if not resp_line:
-            raise RuntimeError("Interactive process died")
+            # Child died. Drop its registry entry so the next request spawns
+            # a fresh one, and include the most actionable stderr line.
+            pid = proc.pid
+            rc = proc.poll()
+            tail = _stderr_tail(proc)
+            with _interactive_lock:
+                for key, p in list(_interactive_procs.items()):
+                    if p.pid == pid:
+                        _interactive_procs.pop(key, None)
+                _interactive_stderr.pop(pid, None)
+            msg = f"Interactive process died (rc={rc})"
+            if tail:
+                msg += f": {tail}"
+            raise RuntimeError(msg)
         resp_line = resp_line.strip()
         if resp_line.startswith("{"):
             return json.loads(resp_line)
@@ -247,7 +403,122 @@ def serve_client():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "default_model": DEFAULT_MODEL_ID, "models": list(MODEL_REGISTRY.keys())}
+    return {
+        "status": "ok",
+        "default_model": DEFAULT_MODEL_ID,
+        "models": list(MODEL_REGISTRY.keys()),
+        "loaded": _loaded_model_ids(),
+    }
+
+
+def _loaded_model_ids() -> list[str]:
+    """Which model IDs currently have a live interactive child?"""
+    out: list[str] = []
+    with _interactive_lock:
+        for key, proc in _interactive_procs.items():
+            if proc.poll() is None:
+                model_path = key.rsplit(":", 1)[0]
+                for mid, info in MODEL_REGISTRY.items():
+                    if info.get("path") == model_path:
+                        out.append(mid)
+                        break
+    return out
+
+
+def _kill_all_procs(graceful: bool = True) -> int:
+    """Terminate every live interactive child. Returns the number killed."""
+    killed = 0
+    with _interactive_lock:
+        for key, proc in list(_interactive_procs.items()):
+            if proc.poll() is None:
+                try:
+                    if graceful:
+                        try:
+                            proc.stdin.write("quit\n")
+                            proc.stdin.flush()
+                        except Exception:
+                            pass
+                        try:
+                            proc.wait(timeout=3)
+                        except Exception:
+                            proc.kill()
+                    else:
+                        proc.kill()
+                    killed += 1
+                except Exception:
+                    pass
+            _interactive_procs.pop(key, None)
+    return killed
+
+
+@app.post("/load")
+def load_model(model: str = "", kick_others: bool = True):
+    """Load a model (start its interactive child). Optionally evict others
+    first so only this model occupies VRAM.
+
+    Query params:
+        model        — one of the registered IDs (/models). Falls back to DEFAULT_MODEL_ID.
+        kick_others  — if true (default), all other interactive children are
+                       killed before starting this one. Required when two
+                       models can't co-reside in VRAM.
+    """
+    mid = model.strip() or DEFAULT_MODEL_ID
+    if mid not in MODEL_REGISTRY:
+        return JSONResponse({"error": f"unknown model: {mid}",
+                             "available": list(MODEL_REGISTRY.keys())},
+                            status_code=400)
+    info = MODEL_REGISTRY[mid]
+    path = info["path"]
+    ngl  = info.get("ngl", -1)
+
+    if kick_others:
+        with _interactive_lock:
+            for key, proc in list(_interactive_procs.items()):
+                if key.startswith(f"{path}:"):
+                    continue  # keep the one we're about to use
+                if proc.poll() is None:
+                    try:
+                        proc.stdin.write("quit\n"); proc.stdin.flush()
+                        proc.wait(timeout=3)
+                    except Exception:
+                        proc.kill()
+                _interactive_procs.pop(key, None)
+
+    try:
+        _get_interactive_proc(path, ngl)   # starts it if not already alive
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return {"ok": True, "loaded": _loaded_model_ids(), "model": mid}
+
+
+@app.post("/unload")
+def unload(model: str = ""):
+    """Unload one model (if `model` given) or all models (if empty).
+    Frees VRAM immediately. Subsequent /tts calls will re-load on demand."""
+    if model:
+        if model not in MODEL_REGISTRY:
+            return JSONResponse({"error": f"unknown model: {model}"}, status_code=400)
+        target_path = MODEL_REGISTRY[model]["path"]
+        killed = 0
+        with _interactive_lock:
+            for key, proc in list(_interactive_procs.items()):
+                if key.startswith(f"{target_path}:") and proc.poll() is None:
+                    try:
+                        proc.stdin.write("quit\n"); proc.stdin.flush()
+                        proc.wait(timeout=3)
+                    except Exception:
+                        proc.kill()
+                    killed += 1
+                    _interactive_procs.pop(key, None)
+        return {"ok": True, "killed": killed, "loaded": _loaded_model_ids()}
+    killed = _kill_all_procs()
+    return {"ok": True, "killed": killed, "loaded": _loaded_model_ids()}
+
+
+@app.get("/loaded")
+def loaded():
+    """Inspect what's currently in memory."""
+    return {"loaded": _loaded_model_ids()}
 
 
 @app.get("/models")
@@ -372,7 +643,37 @@ async def tts(
     audio_repetition_penalty: float = Form(0),
     seed: int = Form(0),
     format: str = Form("mp3"),
+    transcript: bool = Form(False),
 ):
+    """Generate speech from text.
+
+    **Parameters**
+    - `text` (required): text to speak.
+    - `voice`: voice ID (see `GET /voices`). Ignored if `reference_audio` is uploaded.
+    - `model`: model ID (see `GET /models`). Defaults to the first available.
+    - `preset`: quality preset ID (see `GET /presets`), e.g. `stable`, `balanced`, `expressive`.
+    - `language`: BCP-47-ish language hint (`en`, `fr`, `de`, `es`, `zh` …).
+    - `reference_audio`: upload a WAV to clone a voice (overrides `voice`).
+    - `audio_temperature`, `audio_top_p`, `audio_top_k`, `audio_repetition_penalty`: sampling overrides (0 = use preset).
+    - `seed`: RNG seed (0 = random).
+    - `format`: `mp3` (default) or `wav`.
+    - `transcript`: if true, also run forced alignment and return word-level timestamps.
+
+    **Response**
+    - `transcript=false` (default): binary audio (`audio/mpeg` or `audio/wav`).
+    - `transcript=true`: JSON object:
+      ```json
+      {
+        "format": "mp3",
+        "audio_b64": "<base64-encoded audio>",
+        "words": [
+          {"text": "hello", "start": 0.12, "end": 0.45, "score": -2.3},
+          ...
+        ]
+      }
+      ```
+      If alignment fails, `words` becomes `{"error": "..."}` while audio is still returned.
+    """
     text = (text or "").strip()
     if not text:
         return JSONResponse({"error": "text is required"}, status_code=400)
@@ -435,6 +736,14 @@ async def tts(
         if not Path(out_file.name).exists() or Path(out_file.name).stat().st_size == 0:
             return JSONResponse({"error": "no audio generated"}, status_code=500)
 
+        # Run forced alignment on the WAV before encoding (alignment needs WAV, not MP3)
+        words = None
+        if transcript:
+            try:
+                words = _align_words(out_file.name, text)
+            except Exception as align_err:
+                words = {"error": f"alignment failed: {align_err}"}
+
         # Return audio
         fmt = format.lower()
         if fmt == "wav":
@@ -447,6 +756,13 @@ async def tts(
             filename = "speech.mp3"
 
         os.unlink(out_file.name)
+
+        if transcript:
+            return JSONResponse({
+                "format": fmt if fmt == "wav" else "mp3",
+                "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                "words": words,
+            })
 
         return StreamingResponse(
             io.BytesIO(audio_bytes),

@@ -68,6 +68,18 @@ audio { width: 100%; height: 40px; margin-top: 8px; }
 /* Reference audio section */
 .ref-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid #2a2a2a; }
 .ref-label { font-size: 12px; color: #666; margin-bottom: 6px; }
+
+/* Checkbox row */
+.chk-row { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+.chk-row input[type="checkbox"] { width: auto; accent-color: #b45309; }
+.chk-row label { margin: 0; cursor: pointer; }
+
+/* Transcript */
+.transcript { margin-top: 10px; padding: 10px; background: #111; border: 1px solid #2a2a2a; border-radius: 8px; line-height: 2; font-size: 14px; }
+.transcript .word { display: inline-block; padding: 1px 4px; margin: 1px; border-radius: 4px; cursor: pointer; transition: background 0.1s; }
+.transcript .word:hover { background: #2a2a2a; }
+.transcript .word.active { background: #b45309; color: white; }
+.transcript-meta { font-size: 11px; color: #666; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -144,6 +156,10 @@ audio { width: 100%; height: 40px; margin-top: 8px; }
                 <input type="number" id="seed" value="0" min="0" placeholder="0 = random">
             </div>
         </div>
+        <div class="chk-row">
+            <input type="checkbox" id="transcript">
+            <label for="transcript">Return word-level transcript (click words to seek)</label>
+        </div>
     </div>
 
     <!-- Generate -->
@@ -154,8 +170,11 @@ audio { width: 100%; height: 40px; margin-top: 8px; }
     <div class="card" id="output-card" style="display:none; margin-top: 16px;">
         <div class="card-title">Output</div>
         <audio id="output-player" controls></audio>
+        <div id="transcript-box" class="transcript" style="display:none"></div>
         <div style="margin-top: 8px; text-align: right;">
-            <a id="download-link" class="btn btn-sm btn-stop" download="speech.mp3">Download</a>
+            <a id="download-json" class="btn btn-sm btn-stop" download="speech.json" style="display:none; margin-right: 6px;">Download JSON</a>
+            <a id="download-srt" class="btn btn-sm btn-stop" download="speech.srt" style="display:none; margin-right: 6px;">Download SRT</a>
+            <a id="download-link" class="btn btn-sm btn-stop" download="speech.mp3">Download Audio</a>
         </div>
     </div>
 </div>
@@ -327,6 +346,69 @@ async function saveVoice() {
 }
 
 // ── Generation ──────────────────────────────────────────────────────────────
+let currentWords = [];
+let highlightTimer = null;
+
+function b64ToBlob(b64, mime) {
+    const bin = atob(b64);
+    const buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+    return new Blob([buf], { type: mime });
+}
+
+function renderTranscript(words) {
+    currentWords = words || [];
+    const box = document.getElementById('transcript-box');
+    const player = document.getElementById('output-player');
+
+    if (!words || !Array.isArray(words) || words.length === 0) {
+        box.style.display = 'none';
+        document.getElementById('download-json').style.display = 'none';
+        document.getElementById('download-srt').style.display = 'none';
+        return;
+    }
+
+    box.innerHTML = '';
+    words.forEach((w, i) => {
+        const span = document.createElement('span');
+        span.className = 'word';
+        span.dataset.idx = i;
+        span.textContent = w.text;
+        span.title = `${w.start.toFixed(2)}s – ${w.end.toFixed(2)}s`;
+        span.onclick = () => { player.currentTime = w.start; player.play(); };
+        box.appendChild(span);
+        box.appendChild(document.createTextNode(' '));
+    });
+    const meta = document.createElement('div');
+    meta.className = 'transcript-meta';
+    meta.textContent = `${words.length} words`;
+    box.appendChild(meta);
+    box.style.display = '';
+}
+
+function highlightActiveWord() {
+    const player = document.getElementById('output-player');
+    if (player.paused || player.ended) return;
+    const t = player.currentTime;
+    const spans = document.querySelectorAll('#transcript-box .word');
+    let activeIdx = -1;
+    for (let i = 0; i < currentWords.length; i++) {
+        if (t >= currentWords[i].start && t <= currentWords[i].end) { activeIdx = i; break; }
+    }
+    spans.forEach(s => s.classList.toggle('active', Number(s.dataset.idx) === activeIdx));
+}
+
+function wordsToSrt(words) {
+    const fmt = (s) => {
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = Math.floor(s % 60);
+        const ms = Math.floor((s - Math.floor(s)) * 1000);
+        return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
+    };
+    return words.map((w, i) => `${i+1}\n${fmt(w.start)} --> ${fmt(w.end)}\n${w.text}\n`).join('\n');
+}
+
 async function generate() {
     const text = document.getElementById('text').value.trim();
     if (!text) { setStatus('Enter some text first.', 'error'); return; }
@@ -336,13 +418,17 @@ async function generate() {
     btn.innerHTML = '<span class="spinner"></span> Generating...';
     setStatus('');
 
+    const wantTranscript = document.getElementById('transcript').checked;
+    const fmt = document.getElementById('format').value;
+
     const formData = new FormData();
     formData.append('text', text);
     formData.append('voice', document.getElementById('voice').value);
     formData.append('model', document.getElementById('model').value);
     formData.append('preset', document.getElementById('preset').value);
-    formData.append('format', document.getElementById('format').value);
+    formData.append('format', fmt);
     formData.append('seed', document.getElementById('seed').value);
+    if (wantTranscript) formData.append('transcript', 'true');
 
     if (recordedBlob) {
         formData.append('reference_audio', recordedBlob, 'recording.wav');
@@ -354,13 +440,24 @@ async function generate() {
         const resp = await fetch(`${API}/tts`, { method: 'POST', body: formData });
 
         if (!resp.ok) {
-            const err = await resp.json();
+            const err = await resp.json().catch(() => ({ error: 'Generation failed' }));
             throw new Error(err.error || 'Generation failed');
         }
 
-        const blob = await resp.blob();
-        const url = URL.createObjectURL(blob);
-        const fmt = document.getElementById('format').value;
+        let audioBlob, words = null;
+        if (wantTranscript) {
+            const data = await resp.json();
+            const mime = data.format === 'wav' ? 'audio/wav' : 'audio/mpeg';
+            audioBlob = b64ToBlob(data.audio_b64, mime);
+            words = Array.isArray(data.words) ? data.words : null;
+            if (data.words && data.words.error) {
+                setStatus('Alignment failed: ' + data.words.error, 'error');
+            }
+        } else {
+            audioBlob = await resp.blob();
+        }
+
+        const url = URL.createObjectURL(audioBlob);
         const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
         const player = document.getElementById('output-player');
@@ -371,6 +468,20 @@ async function generate() {
         dl.href = url;
         dl.download = `speech.${fmt}`;
         dl.textContent = `Download ${fmt.toUpperCase()}`;
+
+        renderTranscript(words);
+        if (words && words.length > 0) {
+            const jsonBlob = new Blob([JSON.stringify(words, null, 2)], { type: 'application/json' });
+            document.getElementById('download-json').href = URL.createObjectURL(jsonBlob);
+            document.getElementById('download-json').style.display = '';
+            const srtBlob = new Blob([wordsToSrt(words)], { type: 'application/x-subrip' });
+            document.getElementById('download-srt').href = URL.createObjectURL(srtBlob);
+            document.getElementById('download-srt').style.display = '';
+            if (highlightTimer) clearInterval(highlightTimer);
+            highlightTimer = setInterval(highlightActiveWord, 50);
+        } else {
+            if (highlightTimer) { clearInterval(highlightTimer); highlightTimer = null; }
+        }
 
         document.getElementById('output-card').style.display = '';
         setStatus(`Generated in ${elapsed}s`, 'success');
