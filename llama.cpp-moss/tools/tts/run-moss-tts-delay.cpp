@@ -557,6 +557,10 @@ static llama_context_ptr moss_init_audio_context(
         llama_model * model,
         uint32_t n_ctx) {
     llama_context_params cparams = llama_context_default_params();
+    // MOSS_NO_FLASH_ATTN: force-disable flash attention (the sm_75/Turing WMMA FA
+    // kernels crash with an illegal memory access on the Kaggle T4). Slower but
+    // correct; local (sm_120) leaves the env unset and keeps FA on.
+    if (getenv("MOSS_NO_FLASH_ATTN")) cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.n_ctx = std::max<uint32_t>(n_ctx, 1u);
     cparams.n_batch = std::max<uint32_t>(n_ctx, 1u);
     cparams.n_ubatch = cparams.n_batch;
@@ -1929,6 +1933,7 @@ static void moss_generate_from_prompt(
         }
 
         llama_context_params cparams = llama_context_default_params();
+        if (getenv("MOSS_NO_FLASH_ATTN")) cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cparams.n_ctx = std::max<uint32_t>((uint32_t) prompt_frames + (uint32_t) max_new_tokens + 8u, 64u);
         cparams.n_batch = std::max<uint32_t>((uint32_t) prompt_frames, 1u);
         cparams.n_ubatch = cparams.n_batch;
@@ -2507,6 +2512,7 @@ static void moss_interactive_loop(
                     vocab, cfg, req_text, req_language, reference_codes, reference_frames);
 
             llama_context_params cparams = llama_context_default_params();
+            if (getenv("MOSS_NO_FLASH_ATTN")) cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
             cparams.n_ctx = std::max<uint32_t>(
                     (uint32_t) prompt.prompt_frames + (uint32_t) req_max_tokens + 8u, 64u);
             cparams.n_batch = std::max<uint32_t>((uint32_t) prompt.prompt_frames, 1u);
