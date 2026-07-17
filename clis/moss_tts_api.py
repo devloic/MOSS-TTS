@@ -260,6 +260,24 @@ def _get_interactive_proc(model_path: str, ngl: int) -> subprocess.Popen:
         if ENCODER_PATH and Path(ENCODER_PATH).exists():
             cmd.extend(["--audio-encoder-model", ENCODER_PATH])
 
+        # DIAGNOSTIC: wrap under compute-sanitizer memcheck to pinpoint the CUDA
+        # fault (op name + address). Enabled via MOSS_CUDA_SANITIZE. Run WITHOUT
+        # CUDA_LAUNCH_BLOCKING so the async race actually manifests for memcheck.
+        if os.environ.get("MOSS_CUDA_SANITIZE"):
+            import shutil as _sh
+            _san = _sh.which("compute-sanitizer")
+            for _c in ("/usr/local/cuda/bin/compute-sanitizer",
+                       "/opt/conda/bin/compute-sanitizer"):
+                if not _san and os.path.exists(_c):
+                    _san = _c
+            if _san:
+                cmd = [_san, "--tool", "memcheck", "--target-processes", "application-only",
+                       "--print-limit", "30"] + cmd
+                sys.stderr.write("[moss-bin] wrapping binary under %s memcheck\n" % _san)
+            else:
+                sys.stderr.write("[moss-bin] MOSS_CUDA_SANITIZE set but compute-sanitizer not found\n")
+            sys.stderr.flush()
+
         # Capture stderr so the final error surfaced to the API caller
         # can include the real root cause (OOM, path not found, etc.)
         # rather than a generic "died during startup".
