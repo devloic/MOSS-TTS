@@ -42,6 +42,7 @@ Example requests:
 import argparse
 import base64
 import io
+import sys
 import json
 import os
 import subprocess
@@ -281,7 +282,12 @@ def _get_interactive_proc(model_path: str, ngl: int) -> subprocess.Popen:
                 return
             for line in proc.stderr:
                 stderr_tail.append(line.rstrip())
-                if len(stderr_tail) > 40:
+                # Forward the FULL binary stderr to our log, not just the single
+                # _stderr_tail() line — under CUDA_LAUNCH_BLOCKING=1 the ggml
+                # CUDA_CHECK prints the failing op + file:line + assert here.
+                sys.stderr.write("[moss-bin] " + line)
+                sys.stderr.flush()
+                if len(stderr_tail) > 200:
                     stderr_tail.pop(0)
         threading.Thread(target=_drain_stderr, daemon=True).start()
 
